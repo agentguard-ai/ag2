@@ -3,15 +3,16 @@
 
 """Tests for TealTiger governance middleware.
 
-Tests use mocked TealTiger engine to avoid requiring the tealtiger package
-in the test environment. Integration test at the bottom uses a real Agent.
+No external dependencies beyond AG2 and stdlib.
+Uses mock Context/events to test governance logic without a running agent.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from ag2.events import ToolCallEvent, ToolErrorEvent, ToolResultEvent
+from ag2.events import ToolCallEvent, ToolErrorEvent
 from ag2.extensions.tealtiger import GovernanceMode, GovernancePolicy, TealTigerMiddleware
 from ag2.extensions.tealtiger.types import GovernanceDecision, TEECReceipt
 from ag2.utils import AGENT_CONTEXT_DEPENDENCY_KEY
@@ -28,151 +29,199 @@ def _make_context(agent_name: str = "assistant") -> MagicMock:
     return ctx
 
 
-def _make_tool_event(name: str = "search", args: str = '{"query": "hello"}') -> MagicMock:
-    """Create a mock ToolCallEvent."""
+def _make_tool_event(name: str = "search", arguments: dict | None = None) -> MagicMock:
+    """Create a mock ToolCallEvent with serialized_arguments."""
     event = MagicMock(spec=ToolCallEvent)
     event.name = name
-    event.arguments = args
+    args = arguments or {}
+    event.serialized_arguments = args
+    event.arguments = json.dumps(args)
     event.call_id = "call-123"
     return event
-
-
-def _make_tool_result() -> MagicMock:
-    """Create a mock ToolResultEvent (successful execution)."""
-    result = MagicMock(spec=ToolResultEvent)
-    return result
-
-
-@pytest.fixture
-def governance():
-    """Create a TealTigerMiddleware with mocked TealTiger engine."""
-    with patch("ag2.extensions.tealtiger.middleware.tealtiger") as mock_tt:
-        # Mock TealEngine
-        mock_engine = MagicMock()
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-        mock_tt.TealEngine.return_value = mock_engine
-
-        mw = TealTigerMiddleware(
-            policies=[
-                GovernancePolicy.tool_allowlist(["search", "read_*"]),
-                GovernancePolicy.pii_block(["ssn", "credit_card"]),
-                GovernancePolicy.cost_limit(max_per_session=5.0),
-            ],
-            mode=GovernanceMode.ENFORCE,
-            cost_per_call=0.01,
-        )
-        yield mw, mock_engine
 
 
 # ─── Factory pattern tests ───────────────────────────────────────────────────
 
 
 class TestFactoryPattern:
-    def test_call_returns_base_middleware(self, governance):
-        mw_factory, _ = governance
+    def test_call_returns_base_middleware(self):
+        mw = TealTigerMiddleware(policies=[GovernancePolicy.tool_allowlist(["search"])])
         ctx = _make_context()
         event = MagicMock()
 
-        per_turn = mw_factory(event, ctx)
+        per_turn = mw(event, ctx)
 
-        # Should be a BaseMiddleware instance
         from ag2.middleware import BaseMiddleware
 
         assert isinstance(per_turn, BaseMiddleware)
 
-    def test_state_persists_across_turns(self, governance):
-        mw_factory, _ = governance
+    def test_state_persists_across_turns(self):
+        mw = TealTigerMiddleware()
         ctx = _make_context()
         event = MagicMock()
 
-        turn1 = mw_factory(event, ctx)
-        turn2 = mw_factory(event, ctx)
+        turn1 = mw(event, ctx)
+        turn2 = mw(event, ctx)
 
-        # Both turns share the same factory state
         assert turn1._factory is turn2._factory
         assert turn1._factory._decisions is turn2._factory._decisions
 
 
-# ─── Tool execution governance tests ────────────────────────────────────────
+# ─── Tool allowlist tests ────────────────────────────────────────────────────
 
 
-class TestToolExecution:
+class TestToolAllowlist:
     @pytest.mark.asyncio
-    async def test_allow_passes_through(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-
+    async def test_allowed_tool_passes(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search", "read_*"])],
+            mode=GovernanceMode.ENFORCE,
+        )
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        tool_event = _make_tool_event()
-        expected_result = _make_tool_result()
-        call_next = AsyncMock(return_value=expected_result)
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="search")
+        call_next = AsyncMock(return_value=MagicMock())
 
-        result = await per_turn.on_tool_execution(call_next, tool_event, ctx)
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
 
-        assert result is expected_result
         call_next.assert_awaited_once()
-        assert len(mw_factory._decisions) == 1
-        assert mw_factory._decisions[0].action == "ALLOW"
+        assert not isinstance(result, ToolErrorEvent)
 
     @pytest.mark.asyncio
-    async def test_deny_returns_tool_error_event(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "DENY",
-            "reason_codes": ["PII_DETECTED:ssn"],
-            "risk_score": 90,
-        }
-
+    async def test_denied_tool_returns_error(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.ENFORCE,
+        )
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        tool_event = _make_tool_event(name="send_email")
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="delete_all")
         call_next = AsyncMock()
 
-        result = await per_turn.on_tool_execution(call_next, tool_event, ctx)
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
 
-        # Must return ToolErrorEvent, not a string
         assert isinstance(result, ToolErrorEvent)
         assert "GOVERNANCE DENIED" in str(result.error)
-        assert "send_email" in str(result.error)
-        # call_next should NOT be called for denied tools
+        assert "TOOL_NOT_ALLOWED" in str(result.error)
         call_next.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_deny_in_observe_mode_still_allows(self, governance):
-        """In OBSERVE mode, even DENY decisions pass through."""
-        with patch("ag2.extensions.tealtiger.middleware.tealtiger") as mock_tt:
-            mock_engine = MagicMock()
-            mock_engine.evaluate.return_value = {
-                "action": "DENY",
-                "reason_codes": ["PII"],
-                "risk_score": 90,
-            }
-            mock_tt.TealEngine.return_value = mock_engine
-
-            mw = TealTigerMiddleware(
-                policies=[GovernancePolicy.pii_block()],
-                mode=GovernanceMode.OBSERVE,
-            )
-
+    async def test_glob_pattern_matching(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["read_*", "search"])],
+            mode=GovernanceMode.ENFORCE,
+        )
         ctx = _make_context()
         per_turn = mw(MagicMock(), ctx)
-        tool_event = _make_tool_event()
-        expected_result = _make_tool_result()
-        call_next = AsyncMock(return_value=expected_result)
+        event = _make_tool_event(name="read_file")
+        call_next = AsyncMock(return_value=MagicMock())
 
-        result = await per_turn.on_tool_execution(call_next, tool_event, ctx)
+        await per_turn.on_tool_execution(call_next, event, ctx)
 
-        # OBSERVE mode: passes through even on DENY
-        assert result is expected_result
+        call_next.assert_awaited_once()
+
+
+# ─── PII detection tests ─────────────────────────────────────────────────────
+
+
+class TestPIIDetection:
+    @pytest.mark.asyncio
+    async def test_ssn_blocked(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.pii_block(["ssn"])],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="send", arguments={"data": "SSN: 123-45-6789"})
+        call_next = AsyncMock()
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+        assert "PII_DETECTED:ssn" in str(result.error)
+        call_next.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clean_args_pass(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.pii_block(["ssn", "credit_card"])],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="search", arguments={"query": "weather"})
+        call_next = AsyncMock(return_value=MagicMock())
+
+        await per_turn.on_tool_execution(call_next, event, ctx)
+
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_email_blocked(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.pii_block(["email"])],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="send", arguments={"to": "user@example.com"})
+        call_next = AsyncMock()
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+        call_next.assert_not_awaited()
+
+
+# ─── Secret detection tests ──────────────────────────────────────────────────
+
+
+class TestSecretDetection:
+    @pytest.mark.asyncio
+    async def test_openai_key_blocked(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.secret_detection()],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="run", arguments={"code": "key = 'sk-abcdefghij1234567890abcd'"})
+        call_next = AsyncMock()
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+        assert "SECRET_DETECTED" in str(result.error)
+
+    @pytest.mark.asyncio
+    async def test_aws_key_blocked(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.secret_detection()],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="deploy", arguments={"key": "AKIAIOSFODNN7EXAMPLE"})
+        call_next = AsyncMock()
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+
+    @pytest.mark.asyncio
+    async def test_clean_code_passes(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.secret_detection()],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="run", arguments={"code": "x = 1 + 2"})
+        call_next = AsyncMock(return_value=MagicMock())
+
+        await per_turn.on_tool_execution(call_next, event, ctx)
+
         call_next.assert_awaited_once()
 
 
@@ -181,185 +230,235 @@ class TestToolExecution:
 
 class TestKillSwitch:
     @pytest.mark.asyncio
-    async def test_freeze_blocks_all_tools(self, governance):
-        mw_factory, _ = governance
-        mw_factory.freeze("assistant")
+    async def test_frozen_agent_blocked(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
+        mw.freeze("assistant")
 
         ctx = _make_context("assistant")
-        per_turn = mw_factory(MagicMock(), ctx)
-        tool_event = _make_tool_event()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event()
         call_next = AsyncMock()
 
-        result = await per_turn.on_tool_execution(call_next, tool_event, ctx)
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
 
         assert isinstance(result, ToolErrorEvent)
         assert "AGENT_FROZEN" in str(result.error)
         call_next.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unfreeze_restores_access(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-        mw_factory.freeze("assistant")
-        mw_factory.unfreeze("assistant")
+    async def test_unfreeze_restores_access(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
+        mw.freeze("assistant")
+        mw.unfreeze("assistant")
 
         ctx = _make_context("assistant")
-        per_turn = mw_factory(MagicMock(), ctx)
-        tool_event = _make_tool_event()
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event()
+        call_next = AsyncMock(return_value=MagicMock())
 
-        await per_turn.on_tool_execution(call_next, tool_event, ctx)
+        await per_turn.on_tool_execution(call_next, event, ctx)
 
-        # Should pass through after unfreeze
         call_next.assert_awaited_once()
 
-    def test_freeze_one_agent_doesnt_affect_another(self, governance):
-        mw_factory, _ = governance
-        mw_factory.freeze("agent-a")
+    def test_freeze_one_doesnt_affect_another(self):
+        mw = TealTigerMiddleware()
+        mw.freeze("agent-a")
 
-        assert mw_factory.is_frozen("agent-a")
-        assert not mw_factory.is_frozen("agent-b")
+        assert mw.is_frozen("agent-a")
+        assert not mw.is_frozen("agent-b")
 
 
-# ─── Cost tracking tests ────────────────────────────────────────────────────
+# ─── Governance mode tests ───────────────────────────────────────────────────
+
+
+class TestGovernanceModes:
+    @pytest.mark.asyncio
+    async def test_observe_allows_denied_tool(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.OBSERVE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="delete_all")
+        call_next = AsyncMock(return_value=MagicMock())
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        # OBSERVE mode allows everything through
+        call_next.assert_awaited_once()
+        assert not isinstance(result, ToolErrorEvent)
+
+    @pytest.mark.asyncio
+    async def test_monitor_allows_denied_tool(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.MONITOR,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="delete_all")
+        call_next = AsyncMock(return_value=MagicMock())
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        # MONITOR mode allows through
+        call_next.assert_awaited_once()
+        assert not isinstance(result, ToolErrorEvent)
+
+    @pytest.mark.asyncio
+    async def test_enforce_blocks_denied_tool(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.ENFORCE,
+        )
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        event = _make_tool_event(name="delete_all")
+        call_next = AsyncMock()
+
+        result = await per_turn.on_tool_execution(call_next, event, ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+        call_next.assert_not_awaited()
+
+
+# ─── Cost tracking tests ─────────────────────────────────────────────────────
 
 
 class TestCostTracking:
     @pytest.mark.asyncio
-    async def test_cost_increments_on_allow(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-
+    async def test_cost_increments_on_allow(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE, cost_per_call=0.01)
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
-        assert mw_factory.total_cost == pytest.approx(0.02)
+        assert mw.total_cost == pytest.approx(0.02)
 
     @pytest.mark.asyncio
-    async def test_cost_does_not_increment_on_deny(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "DENY",
-            "reason_codes": ["BUDGET_EXCEEDED"],
-            "risk_score": 70,
-        }
-
+    async def test_cost_not_incremented_on_deny(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.ENFORCE,
+        )
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
+        per_turn = mw(MagicMock(), ctx)
         call_next = AsyncMock()
 
+        await per_turn.on_tool_execution(call_next, _make_tool_event(name="bad_tool"), ctx)
+
+        assert mw.total_cost == 0.0
+
+    @pytest.mark.asyncio
+    async def test_budget_limit_enforced(self):
+        mw = TealTigerMiddleware(
+            mode=GovernanceMode.ENFORCE,
+            budget_limit=0.015,
+            cost_per_call=0.01,
+        )
+        ctx = _make_context()
+        call_next = AsyncMock(return_value=MagicMock())
+
+        # First call: cost 0 < 0.015 → ALLOW
+        per_turn = mw(MagicMock(), ctx)
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
-        assert mw_factory.total_cost == 0.0
+        # Second call: cost 0.01 < 0.015 → ALLOW
+        per_turn = mw(MagicMock(), ctx)
+        await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
+
+        # Third call: cost 0.02 >= 0.015 → DENY
+        per_turn = mw(MagicMock(), ctx)
+        call_next_deny = AsyncMock()
+        result = await per_turn.on_tool_execution(call_next_deny, _make_tool_event(), ctx)
+
+        assert isinstance(result, ToolErrorEvent)
+        assert "BUDGET_EXCEEDED" in str(result.error)
+        call_next_deny.assert_not_awaited()
 
 
-# ─── Decision and receipt audit tests ────────────────────────────────────────
+# ─── Audit trail tests ───────────────────────────────────────────────────────
 
 
 class TestAudit:
     @pytest.mark.asyncio
-    async def test_each_call_produces_unique_decision_id(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-
+    async def test_decisions_recorded(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
+
+        await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
+
+        assert len(mw.decisions) == 1
+        assert mw.decisions[0].action == "ALLOW"
+        assert mw.decisions[0].agent_name == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_unique_decision_ids(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
+        ctx = _make_context()
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
-        ids = [d.decision_id for d in mw_factory.decisions]
+        ids = [d.decision_id for d in mw.decisions]
         assert len(ids) == 2
         assert ids[0] != ids[1]
 
     @pytest.mark.asyncio
-    async def test_receipt_emitted_for_allow(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-
+    async def test_receipt_emitted_for_allow(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
-        assert len(mw_factory.receipts) == 1
-        assert mw_factory.receipts[0].execution_outcome == "executed"
+        assert len(mw.receipts) == 1
+        assert mw.receipts[0].execution_outcome == "executed"
 
     @pytest.mark.asyncio
-    async def test_receipt_emitted_for_deny(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "DENY",
-            "reason_codes": ["TOOL_NOT_ALLOWED"],
-            "risk_score": 80,
-        }
-
+    async def test_receipt_emitted_for_deny(self):
+        mw = TealTigerMiddleware(
+            policies=[GovernancePolicy.tool_allowlist(["search"])],
+            mode=GovernanceMode.ENFORCE,
+        )
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
+        per_turn = mw(MagicMock(), ctx)
         call_next = AsyncMock()
 
-        await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
+        await per_turn.on_tool_execution(call_next, _make_tool_event(name="bad"), ctx)
 
-        assert len(mw_factory.receipts) == 1
-        assert mw_factory.receipts[0].execution_outcome == "blocked"
-        assert mw_factory.receipts[0].policy_digest != ""
+        assert len(mw.receipts) == 1
+        assert mw.receipts[0].execution_outcome == "blocked"
 
     @pytest.mark.asyncio
-    async def test_on_decision_callback_invoked(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
+    async def test_on_decision_callback(self):
         received = []
-        mw_factory.on_decision = lambda d: received.append(d)
-
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE, on_decision=lambda d: received.append(d))
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
         assert len(received) == 1
-        assert isinstance(received[0], GovernanceDecision)
+        assert received[0].agent_name == "assistant"
 
     @pytest.mark.asyncio
-    async def test_on_receipt_callback_invoked(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "DENY",
-            "reason_codes": ["SECRET"],
-            "risk_score": 95,
-        }
+    async def test_on_receipt_callback(self):
         received = []
-        mw_factory.on_receipt = lambda r: received.append(r)
-
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE, on_receipt=lambda r: received.append(r))
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock()
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
 
@@ -372,24 +471,18 @@ class TestAudit:
 
 class TestReset:
     @pytest.mark.asyncio
-    async def test_reset_clears_all_state(self, governance):
-        mw_factory, mock_engine = governance
-        mock_engine.evaluate.return_value = {
-            "action": "ALLOW",
-            "reason_codes": ["POLICY_ALLOW"],
-            "risk_score": 0,
-        }
-
+    async def test_reset_clears_all_state(self):
+        mw = TealTigerMiddleware(mode=GovernanceMode.ENFORCE)
         ctx = _make_context()
-        per_turn = mw_factory(MagicMock(), ctx)
-        call_next = AsyncMock(return_value=_make_tool_result())
+        per_turn = mw(MagicMock(), ctx)
+        call_next = AsyncMock(return_value=MagicMock())
 
         await per_turn.on_tool_execution(call_next, _make_tool_event(), ctx)
-        mw_factory.freeze("assistant")
+        mw.freeze("assistant")
 
-        mw_factory.reset()
+        mw.reset()
 
-        assert len(mw_factory.decisions) == 0
-        assert len(mw_factory.receipts) == 0
-        assert mw_factory.total_cost == 0.0
-        assert not mw_factory.is_frozen("assistant")
+        assert len(mw.decisions) == 0
+        assert len(mw.receipts) == 0
+        assert mw.total_cost == 0.0
+        assert not mw.is_frozen("assistant")
